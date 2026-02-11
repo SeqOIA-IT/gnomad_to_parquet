@@ -1,7 +1,14 @@
+// compilation : cargo build --release --target=x86_64-unknown-linux-musl
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::ops::Index;
 use std::time::{Instant};
 
 use std::sync::Arc;
@@ -19,25 +26,24 @@ use flate2::bufread::MultiGzDecoder;
 
 use std::env;
 use std::path::PathBuf;
-use log::{error,info};
+use log::{error,info,warn};
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
     let args: Vec<String> = env::args().collect();
     let input_vcf_file = args.get(1).unwrap();
-    let chrom = args.get(2).unwrap();
+    // ex : /annotations/Human/GRCh38/DB/public/gnomad/2.1.1/gnomad.exomes.r2.1.1.sites.liftover_grch38.vcf.bgz
     process(        
-        //format!("/data/annotations/Human/GRCh38/DB/public/gnomad/4.0/genomes/gnomad.genomes.v4.0.sites.chr{}.vcf.bgz",chrom).as_str(),
-        input_vcf_file,
-        format!("gnomad_v4_chrom{}.parquet",chrom).as_str() )    
+        
+        input_vcf_file
+        )    
 }
 
 
 
 fn process(
-    input_vcf:&str,
-    out_put_parquet:&str,    
+    input_vcf:&str    
 ) -> anyhow::Result<()> {
         
         
@@ -76,8 +82,8 @@ fn process(
             }
             
         }
-        let mut infos_keys = infos.keys().collect::<Vec<_>>();
-        infos_keys.sort();
+        let mut infos_keys_x = infos.keys().collect::<Vec<_>>();
+        infos_keys_x.sort();
         /* 
         infos_keys = infos_keys.into_iter().filter(|x| 
             if x.starts_with("VRS") || *x=="vep" { // on ne parse pas
@@ -91,8 +97,8 @@ fn process(
         // on ne prends que les clés {annot}_{pop}_{sexe}
         let mut special = Vec::new();
         let annots = vec!["AC","AF","AN","nhomalt"];
-        let pops = vec!["","_afr","_ami","_amr","_asj","_eas","_fin","_nfe","_remaining","_sas","_mid"];
-        let sexes = vec!["","_XX","_XY"];
+        let pops = vec!["","_afr","_ami","_amr","_asj","_eas","_fin","_nfe","_remaining","_sas","_mid"];        
+        let sexes = vec!["","_female","_male"];
 
         for annot in annots.iter() {
             for pop in pops.iter() {
@@ -102,12 +108,47 @@ fn process(
             }
         }
 
-        infos_keys = infos_keys.into_iter().filter(|x| special.contains(x)).collect();
+        let mut special_parquet_name = Vec::new();
+        let annots_parquet_name = vec!["AC","AF","AN","nhomalt"];
+        let pops_parquet_name = vec!["","_afr","_ami","_amr","_asj","_eas","_fin","_nfe","_remaining","_sas","_mid"];        
+        let sexes_parquet_name = vec!["","_XX","_XY"];
+
+        for annot_parquet_name in annots_parquet_name.iter() {
+            for pop_parquet_name in pops_parquet_name.iter() {
+                for sexe_parquet_name in sexes_parquet_name.iter() {
+                    special_parquet_name.push(format!("{}{}{}",annot_parquet_name,pop_parquet_name,sexe_parquet_name))
+                }
+            }
+        }
+
+
+
+        let infos_keys:Vec<(&String,&String)> = infos_keys_x.into_iter().filter(|x| {
+            
+            if special.contains(x) {
+                true
+            } else {                
+                println!("info : key {} in vcf but not selected for parquet",x);
+                false
+            }
+            
+        }).map(|x| (x,special_parquet_name.get(special.iter().position(|n| n == x).unwrap()).unwrap())).collect();
+
+        println!("--------");
+        
+        special.iter().for_each(|target| {
+            
+            if infos_keys.iter().find(|(x,y)| target==*y).is_none() {
+                println!("warning : desired key {} not in vcf",target);
+            }
+
+        });
 
 
 
         
-        let file = std::fs::File::create(format!("{}",out_put_parquet)).unwrap();
+        let mut current_chrom=1;
+        let mut file = std::fs::File::create(format!("gnomad_v4_chrom{}.parquet",current_chrom)).unwrap();
         let batch_size = 100_000;
         // Default writer properties
         let props = WriterProperties::builder()
@@ -125,14 +166,15 @@ fn process(
         fields.push(Field::new("a_ref", DataType::Utf8, false));
         fields.push(Field::new("a_alt", DataType::Utf8, false));
 
-        for key in infos_keys.iter() {
-            
-            let info_f = infos.get(*key).unwrap();
+        for (vcf_key,parquet_key) in &infos_keys {
+
+
+            let info_f = infos.get(*vcf_key).unwrap();
             match info_f.value_type {
-                ValueType::Flag => fields.push(Field::new(key, DataType::Boolean, true)),
-                ValueType::Float => fields.push(Field::new(key, DataType::Float64, true)),
-                ValueType::String => fields.push(Field::new(key, DataType::Utf8, true)),
-                ValueType::Integer => fields.push(Field::new(key, DataType::Int32, true)),
+                ValueType::Flag => fields.push(Field::new(parquet_key, DataType::Boolean, true)),
+                ValueType::Float => fields.push(Field::new(parquet_key, DataType::Float64, true)),
+                ValueType::String => fields.push(Field::new(parquet_key, DataType::Utf8, true)),
+                ValueType::Integer => fields.push(Field::new(parquet_key, DataType::Int32, true)),
             }
         
             
@@ -147,8 +189,8 @@ fn process(
 
         let mut fields_buffer = Vec::new();
 
-        for info_key in infos_keys.iter() {
-            let info = infos.get(*info_key).unwrap();
+        for (vcf_key,parquet_key) in infos_keys.iter() {
+            let info = infos.get(*vcf_key).unwrap();
 
             let builder = match info.value_type {
                 
@@ -166,7 +208,7 @@ fn process(
 
         let schema = Arc::new(Schema::new(fields));
         
-        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone())).unwrap();
 
 
         
@@ -178,7 +220,68 @@ fn process(
         while let Some(Ok(l2)) = it.next() {
             let one_line = l2.split("\t").collect::<Vec<_>>();
             //let info_fields=;
-            let chrom= compute_contig_num(one_line[0])?;
+            let chrom_r= compute_contig_num(one_line[0]);
+
+            if chrom_r.is_err() {
+                warn!("can't parse chrom {} ",one_line[0]);
+                continue;
+            }
+
+            let chrom = chrom_r?;
+
+            if chrom!=current_chrom {
+                // on change de chrom
+                if contig_builder.len()>0 {
+                    // write to parquet
+                    let mut rb = Vec::new();                        
+                    rb.push(Arc::new(contig_builder.finish()) as ArrayRef);        
+                    rb.push(Arc::new(pos_builder.finish()) as ArrayRef);
+                    rb.push(Arc::new(ref_alt_hash_builder.finish()) as ArrayRef);
+                    rb.push(Arc::new(a_ref_builder.finish()) as ArrayRef);
+                    rb.push( Arc::new(a_alt_builder.finish()) as ArrayRef);
+                    
+                    for mut f in fields_buffer.into_iter() {                   
+                        rb.push( f.finish() as ArrayRef);                   
+                    }
+                    let batch = RecordBatch::try_new(schema.clone(),rb).unwrap();
+        
+                    
+                    writer.write(&batch).expect("Writing batch");
+        
+                    
+                }
+        
+                writer.close()?;
+
+                current_chrom = chrom;
+                file = std::fs::File::create(format!("gnomad_v4_chrom{}.parquet",current_chrom)).unwrap();
+                writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone())).unwrap();
+                last_pos = 1;
+                contig_builder = Int32Builder::new(batch_size);        
+                pos_builder = Int32Builder::new(batch_size);
+                ref_alt_hash_builder = Int64Builder::new(batch_size);
+                a_ref_builder = StringBuilder::new(batch_size);
+                a_alt_builder = StringBuilder::new(batch_size);
+                fields_buffer = Vec::new();
+
+                for (vcf_key,parquet_key) in infos_keys.iter() {
+                    let info = infos.get(*vcf_key).unwrap();
+        
+                    let builder = match info.value_type {
+                        
+                        ValueType::String =>  Box::new(StringBuilder::new(batch_size)) as Box<dyn ArrayBuilder>,
+                        ValueType::Float =>  Box::new(Float64Builder::new(batch_size)) as Box<dyn ArrayBuilder>,
+                        ValueType::Integer =>  Box::new(Int32Builder::new(batch_size)) as Box<dyn ArrayBuilder>,
+                        ValueType::Flag =>  Box::new(BooleanBuilder::new(batch_size)) as Box<dyn ArrayBuilder>,
+                        
+                    };
+                   
+                    
+                    fields_buffer.push(builder);
+        
+                }
+
+            }
             let pos = one_line[1].parse::<u32>()?;
             let a_ref = one_line[3].to_string();
             let a_alt = one_line[4].to_string();
@@ -192,9 +295,7 @@ fn process(
             last_pos = pos;
 
             let h = parse_all_info(&one_line.get(7).unwrap(),&infos,&infos_keys)?;
-            if count==0 {
-                println!("{:?}",h);
-            }
+            
             
             contig_builder.append_value(chrom as i32).unwrap();                
             pos_builder.append_value(pos as i32).unwrap();
@@ -205,11 +306,11 @@ fn process(
             a_ref_builder.append_value(a_ref).unwrap();
             a_alt_builder.append_value(a_alt).unwrap();
             
-            for (index,info_key) in infos_keys.iter().enumerate() {
+            for (index,(vcf_key,parquet_key)) in infos_keys.iter().enumerate() {
                 let  b = &mut fields_buffer.get_mut(index).unwrap();
 
-                let info = infos.get(*info_key).unwrap();
-                let value = h.get(*info_key);
+                let info = infos.get(*vcf_key).unwrap();
+                let value = h.get(*vcf_key);
     
                 match info.value_type {
                     
@@ -219,7 +320,7 @@ fn process(
                         match value {
                             Some(ValueParsed::Float(n)) => builder.append_value(*n).unwrap(),
                             None | Some(ValueParsed::Null) => builder.append_null().unwrap(),
-                            _=> return Err(anyhow!("value shoud be float for field {}",info_key))
+                            _=> return Err(anyhow!("value shoud be float for field {}",vcf_key))
                         }
                     }
                     ValueType::Integer =>  {
@@ -227,7 +328,7 @@ fn process(
                         match value {
                             Some(ValueParsed::Integer(n)) => builder.append_value(*n).unwrap(),
                             None | Some(ValueParsed::Null)  => builder.append_null().unwrap(),
-                            _=> return Err(anyhow!("value shoud be integer for field {}",info_key))
+                            _=> return Err(anyhow!("value shoud be integer for field {}",vcf_key))
                         }
                     },
                     ValueType::String =>  {
@@ -235,7 +336,7 @@ fn process(
                         match value {
                             Some(ValueParsed::String(n)) => builder.append_value(n).unwrap(),
                             None | Some(ValueParsed::Null)  => builder.append_null().unwrap(),
-                            _=> return Err(anyhow!("value shoud be string for field {}",info_key))
+                            _=> return Err(anyhow!("value shoud be string for field {}",vcf_key))
                         }
                     },
                     ValueType::Flag =>  {
@@ -243,7 +344,7 @@ fn process(
                         match value {
                             Some(ValueParsed::Flag(n)) => builder.append_value(*n).unwrap(),
                             None | Some(ValueParsed::Null)  => builder.append_null().unwrap(),
-                            _=> return Err(anyhow!("value shoud be flag for field {}",info_key))
+                            _=> return Err(anyhow!("value shoud be flag for field {}",vcf_key))
                         }
                     },
 
@@ -280,8 +381,8 @@ fn process(
                 a_alt_builder = StringBuilder::new(batch_size);
                 fields_buffer = Vec::new();
 
-                for info_key in infos_keys.iter() {
-                    let info = infos.get(*info_key).unwrap();
+                for (vcf_key,parquet_key) in infos_keys.iter() {
+                    let info = infos.get(*vcf_key).unwrap();
         
                     let builder = match info.value_type {
                         
@@ -330,7 +431,7 @@ fn process(
 
     
 
-    pub fn parse_all_info(info_fields:&str,infos:&HashMap<String,InfoFormatConfig>,infos_keys:&Vec<&String>) -> anyhow::Result<HashMap<String,ValueParsed>>{
+    pub fn parse_all_info(info_fields:&str,infos:&HashMap<String,InfoFormatConfig>,infos_keys:&Vec<(&String,&String)>) -> anyhow::Result<HashMap<String,ValueParsed>>{
         let mut h = HashMap::new();
         // maintenant nous parsons les lignes
         let k_vs = info_fields.split(";").collect::<Vec<_>>().iter().map(|kv| {
@@ -344,7 +445,7 @@ fn process(
         }
         ).collect::<anyhow::Result<HashMap<_,_>>>()?;
         // liste des [k,v]
-        for k in infos_keys {
+        for (k,_x) in infos_keys {
         //for k_v in k_vs {
             if let Some(v) = k_vs.get(*k) {
                 h.insert(k.to_string(),convert(k,v,infos)?);
@@ -428,7 +529,7 @@ fn process(
         pub enum ValueParsed {
         String(String),
         Integer(i32),
-        Float(f64),
+        Float(f64),        
         Flag(bool),
         Null
     }
@@ -437,7 +538,7 @@ fn process(
     pub enum ValueType {        
         String,
         Integer,
-        Float,
+        Float,        
         Flag
     }
     
@@ -456,7 +557,7 @@ fn process(
                     Ok(num)
                 },
                 Ok(_) => Err(anyhow!("contig not reconize {}",chrom_str)) ,
-                Err(_) => match chrom_str {
+                Err(_) => match chrom_str.to_uppercase().as_str() {
                     "X" => Ok(23),
                     "Y" => Ok(24),
                     "MT" => Ok(25),
