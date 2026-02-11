@@ -28,7 +28,6 @@ fn main() -> anyhow::Result<()> {
     let input_vcf_file = args.get(1).unwrap();
     let chrom = args.get(2).unwrap();
     process(        
-        //format!("/data/annotations/Human/GRCh38/DB/public/gnomad/4.0/genomes/gnomad.genomes.v4.0.sites.chr{}.vcf.bgz",chrom).as_str(),
         input_vcf_file,
         format!("gnomad_v4_chrom{}.parquet",chrom).as_str() )    
 }
@@ -192,9 +191,7 @@ fn process(
             last_pos = pos;
 
             let h = parse_all_info(&one_line.get(7).unwrap(),&infos,&infos_keys)?;
-            if count==0 {
-                println!("{:?}",h);
-            }
+            
             
             contig_builder.append_value(chrom as i32).unwrap();                
             pos_builder.append_value(pos as i32).unwrap();
@@ -323,7 +320,7 @@ fn process(
 
         writer.close()?;
 
-        println!("count={}",count);
+        log::info!("nb variants converted {}",count);
         Ok(())
         
     }
