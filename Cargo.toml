@@ -3,18 +3,12 @@ name = "gnomad_to_parquet"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "gnomad_to_parquet_per_chrom"
-path = "src/gnomad_to_parquet_per_chrom.rs"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
-arrow="11.0.0"
-parquet="11.0.0"
-flate2="1.0.22"
-anyhow="1.0.0"
-log = "0.4.14"
-env_logger="0.9.0"
-xxhash-rust={version="0.8.10",features=["xxh64"]}
-tikv-jemallocator = "0.6.0"
+arrow="57"
+parquet="57"
+flate2="1"
+anyhow="1.0"
+log = "0.4"
+env_logger="0.11"
+xxhash-rust={version="0.8",features=["xxh64"]}
+tikv-jemallocator = "0.6"
