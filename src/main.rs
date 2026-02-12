@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::sync::Arc;
-
 use anyhow::anyhow;
 use arrow::array::*;
 use arrow::datatypes::*;
@@ -14,33 +13,60 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use flate2::bufread::MultiGzDecoder;
 
-use std::env;
+
+use tikv_jemallocator::Jemalloc;
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {    
+    #[arg(long, default_value="gnomad_")]
+    prefix_output_filename: String, 
+
+    #[arg(long,default_value=".")]
+    output_dir: String, 
+
+    #[arg(long)]
+    input_fullname:String,
+
+    #[arg(long)]
+    only_chrom:Option<String>, // ex: 1
+}
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
+    
+    let cli = Cli::parse();
+    
+    let ouput_fullname_prefix = format!("{}/{}",cli.output_dir,cli.prefix_output_filename);
 
-    let args: Vec<String> = env::args().collect();
-    let input_vcf_file = args.get(1).unwrap();
-    let chrom = args.get(2).unwrap();
     process(
-        input_vcf_file,
-        format!("gnomad_v4_chrom{}.parquet", chrom).as_str(),
+        &cli.input_fullname,
+        &ouput_fullname_prefix,
+        cli.only_chrom
     )
 }
 
-fn process(input_vcf: &str, out_put_parquet: &str) -> anyhow::Result<()> {
-    let reader: Box<dyn BufRead> = if input_vcf.ends_with("gz") {
+fn process(
+    input_fullname: &str, 
+    ouput_fullname_prefix: &str,
+    only_chrom: Option<String>,
+) -> anyhow::Result<()> {
+    let reader: Box<dyn BufRead> = if input_fullname.ends_with("gz") {
         let f = BufReader::new(
-            File::open(&input_vcf)
-                .map_err(|e| anyhow::anyhow!("erreur fichier {} : {} ", input_vcf, e))?,
+            File::open(&input_fullname)
+                .map_err(|e| anyhow::anyhow!("error file {} : {} ", input_fullname, e))?,
         );
         let gz = MultiGzDecoder::new(f);
         Box::new(BufReader::new(gz))
     } else {
         Box::new(BufReader::with_capacity(
             100 * 128 * 1024,
-            File::open(&input_vcf)
-                .map_err(|e| anyhow::anyhow!("erreur fichier {} : {} ", input_vcf, e))?,
+            File::open(input_fullname)
+                .map_err(|e| anyhow::anyhow!("error file {} : {} ", input_fullname, e))?,
         ))
     };
 
@@ -51,116 +77,70 @@ fn process(input_vcf: &str, out_put_parquet: &str) -> anyhow::Result<()> {
     let mut infos = HashMap::new();
 
     while let Some(Ok(l2)) = it.next() {
-        if l2.starts_with("#CHROM") {
+        if l2.starts_with("#CHROM") { // stop reading the header
             break;
         }
 
-        if l2.starts_with("##INFO") {
+        if l2.starts_with("##INFO") { // reader an INFO line 
             // reading the annotation format
             let info_f = parse_info(&l2).unwrap();
             infos.insert(info_f.name.to_string(), info_f);
         }
     }
-    let mut infos_keys = infos.keys().collect::<Vec<_>>();
-    infos_keys.sort();
 
-    // take only gnomad annotation with format : {annot}_{pop}_{sex}
-    let mut special = Vec::new();
-    let annots = vec!["AC", "AF", "AN", "nhomalt"];
-    let pops = vec![
-        "",
-        "_afr",
-        "_ami",
-        "_amr",
-        "_asj",
-        "_eas",
-        "_fin",
-        "_nfe",
-        "_remaining",
-        "_sas",
-        "_mid",
-    ];
-    let sexes = vec!["", "_XX", "_XY"];
+    let infos_keys = get_infos_keys(&infos)?;
 
-    for annot in annots.iter() {
-        for pop in pops.iter() {
-            for sexe in sexes.iter() {
-                special.push(format!("{}{}{}", annot, pop, sexe))
-            }
-        }
-    }
+    let batch_size = 100_000;    
 
-    infos_keys = infos_keys
-        .into_iter()
-        .filter(|x| special.contains(x))
-        .collect();
+    // construct arrow builders    
+    let mut fields_buffer =  get_arrow_builders(&infos,&infos_keys,batch_size)?;
 
-    let file = std::fs::File::create(format!("{}", out_put_parquet)).unwrap();
-    let batch_size = 100_000;
-    // Default writer properties
-    let props = WriterProperties::builder()
-        //.set_write_batch_size(batch_size)
-        .set_writer_version(WriterVersion::PARQUET_1_0)
-        .set_statistics_enabled(EnabledStatistics::Page)
-        .set_max_row_group_size(batch_size)
-        .set_compression(Compression::SNAPPY)
-        .build();
-
-    let mut fields = Vec::new();
-    fields.push(Field::new("chrom", DataType::Int32, false));
-    fields.push(Field::new("pos", DataType::Int32, false));
-    fields.push(Field::new("ref_alt_hash", DataType::Int64, false));
-    fields.push(Field::new("a_ref", DataType::Utf8, false));
-    fields.push(Field::new("a_alt", DataType::Utf8, false));
-
-    for key in infos_keys.iter() {
-        let info_f = infos.get(*key).unwrap();
-        match info_f.value_type {
-            ValueType::Flag => fields.push(Field::new(*key, DataType::Boolean, true)),
-            ValueType::Float => fields.push(Field::new(*key, DataType::Float64, true)),
-            ValueType::String => fields.push(Field::new(*key, DataType::Utf8, true)),
-            ValueType::Integer => fields.push(Field::new(*key, DataType::Int32, true)),
-        }
-    }
-
-    let mut contig_builder = Int32Builder::with_capacity(batch_size);
-    let mut pos_builder = Int32Builder::with_capacity(batch_size);
-    let mut ref_alt_hash_builder = Int64Builder::with_capacity(batch_size);
-
-    let mut a_ref_builder = StringBuilder::new();
-    let mut a_alt_builder = StringBuilder::new();
-
-    let mut fields_buffer = Vec::new();
-
-    for info_key in infos_keys.iter() {
-        let info = infos.get(*info_key).unwrap();
-
-        let builder = match info.value_type {
-            ValueType::String => Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
-            ValueType::Float => {
-                Box::new(Float64Builder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>
-            }
-            ValueType::Integer => {
-                Box::new(Int32Builder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>
-            }
-            ValueType::Flag => {
-                Box::new(BooleanBuilder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>
-            }
-        };
-
-        fields_buffer.push(builder);
-    }
-
-    let schema = Arc::new(Schema::new(fields));
-
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
-
+    let schema = get_schema(&infos,&infos_keys)?;
+    let mut current_chrom = if let Some(c) = &only_chrom {
+        compute_contig_num(c)?
+    } else {
+        1 as u8
+    };
     let mut last_pos = 1;
+
+    
+    let mut writer = get_writer(schema.clone(),format!("{}{}.parquet",ouput_fullname_prefix,current_chrom),batch_size)?;
+    
+    
 
     while let Some(Ok(l2)) = it.next() {
         let one_line = l2.split("\t").collect::<Vec<_>>();
 
         let chrom = compute_contig_num(one_line[0])?;
+        if only_chrom.is_some() && chrom!=current_chrom {
+            last_pos = 1; // reset last_pos
+            continue; // only_chrom is given, but chrom in line doesn't match, bypass
+        } 
+
+        if only_chrom.is_none() && chrom!=current_chrom {
+            // new chrom, write last data
+            if fields_buffer[0].len() > 0 {
+                // write to parquet
+                let mut rb = Vec::new();        
+                for mut f in fields_buffer.into_iter() {
+                    rb.push(f.finish() as ArrayRef);
+                }
+                let batch = RecordBatch::try_new(schema.clone(), rb).unwrap();
+
+                writer.write(&batch).expect("Writing batch");
+            }
+
+            writer.close()?;
+
+            // create new chrom file
+            current_chrom = chrom;
+            last_pos=1;
+            writer = get_writer(schema.clone(),format!("{}{}.parquet",ouput_fullname_prefix,current_chrom),batch_size)?;
+            fields_buffer =  get_arrow_builders(&infos,&infos_keys,batch_size)?;
+            
+
+        }
+        
         let pos = one_line[1].parse::<u32>()?;
         let a_ref = one_line[3].to_string();
         let a_alt = one_line[4].to_string();
@@ -174,17 +154,16 @@ fn process(input_vcf: &str, out_put_parquet: &str) -> anyhow::Result<()> {
 
         let h = parse_all_info(&one_line.get(7).unwrap(), &infos, &infos_keys)?;
 
-        contig_builder.append_value(chrom as i32);
-        pos_builder.append_value(pos as i32);
+        fields_buffer[0].as_any_mut().downcast_mut::<Int32Builder>().unwrap().append_value(chrom as i32);
+        fields_buffer[1].as_any_mut().downcast_mut::<Int32Builder>().unwrap().append_value(pos as i32);
         use xxhash_rust::xxh64::xxh64;
         let hash = xxh64(format!("{}-{}", a_ref, a_alt).as_bytes(), 0);
-        ref_alt_hash_builder.append_value(hash as i64);
-
-        a_ref_builder.append_value(a_ref);
-        a_alt_builder.append_value(a_alt);
-
+        fields_buffer[2].as_any_mut().downcast_mut::<Int64Builder>().unwrap().append_value(hash as i64);
+        fields_buffer[3].as_any_mut().downcast_mut::<StringBuilder>().unwrap().append_value(a_ref);
+        fields_buffer[4].as_any_mut().downcast_mut::<StringBuilder>().unwrap().append_value(a_alt);
+                
         for (index, info_key) in infos_keys.iter().enumerate() {
-            let b = &mut fields_buffer.get_mut(index).unwrap();
+            let b = &mut fields_buffer.get_mut(index+4).unwrap();
 
             let info = infos.get(*info_key).unwrap();
             let value = h.get(*info_key);
@@ -229,15 +208,9 @@ fn process(input_vcf: &str, out_put_parquet: &str) -> anyhow::Result<()> {
             };
         }
 
-        if contig_builder.len() == batch_size {
+        if fields_buffer[0].len() == batch_size {
             // write to parquet
-            let mut rb = Vec::new();
-            rb.push(Arc::new(contig_builder.finish()) as ArrayRef);
-            rb.push(Arc::new(pos_builder.finish()) as ArrayRef);
-            rb.push(Arc::new(ref_alt_hash_builder.finish()) as ArrayRef);
-            rb.push(Arc::new(a_ref_builder.finish()) as ArrayRef);
-            rb.push(Arc::new(a_alt_builder.finish()) as ArrayRef);
-
+            let mut rb = Vec::new();            
             for mut f in fields_buffer.into_iter() {
                 rb.push(f.finish() as ArrayRef);
             }
@@ -245,44 +218,16 @@ fn process(input_vcf: &str, out_put_parquet: &str) -> anyhow::Result<()> {
 
             writer.write(&batch).expect("Writing batch");
 
-            contig_builder = Int32Builder::with_capacity(batch_size);
-            pos_builder = Int32Builder::with_capacity(batch_size);
-            ref_alt_hash_builder = Int64Builder::with_capacity(batch_size);
-            a_ref_builder = StringBuilder::new();
-            a_alt_builder = StringBuilder::new();
-            fields_buffer = Vec::new();
-
-            for info_key in infos_keys.iter() {
-                let info = infos.get(*info_key).unwrap();
-
-                let builder = match info.value_type {
-                    ValueType::String => Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
-                    ValueType::Float => {
-                        Box::new(Float64Builder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>
-                    }
-                    ValueType::Integer => {
-                        Box::new(Int32Builder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>
-                    }
-                    ValueType::Flag => {
-                        Box::new(BooleanBuilder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>
-                    }
-                };
-
-                fields_buffer.push(builder);
-            }
+            
+            fields_buffer =  get_arrow_builders(&infos,&infos_keys,batch_size)?;
+            
         }
         count += 1;
     }
 
-    if contig_builder.len() > 0 {
+    if fields_buffer[0].len() > 0 {
         // write to parquet
-        let mut rb = Vec::new();
-        rb.push(Arc::new(contig_builder.finish()) as ArrayRef);
-        rb.push(Arc::new(pos_builder.finish()) as ArrayRef);
-        rb.push(Arc::new(ref_alt_hash_builder.finish()) as ArrayRef);
-        rb.push(Arc::new(a_ref_builder.finish()) as ArrayRef);
-        rb.push(Arc::new(a_alt_builder.finish()) as ArrayRef);
-
+        let mut rb = Vec::new();        
         for mut f in fields_buffer.into_iter() {
             rb.push(f.finish() as ArrayRef);
         }
@@ -297,6 +242,121 @@ fn process(input_vcf: &str, out_put_parquet: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn get_arrow_builders(
+    infos:&HashMap<String,InfoFormatConfig>,
+    infos_keys:&Vec<&String>,
+    batch_size:usize,
+) -> anyhow::Result<Vec<Box<dyn ArrayBuilder>>> {
+    let mut fields_buffer = Vec::new();
+
+    let contig_builder = Box::new(Int32Builder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>;
+    let pos_builder = Box::new(Int32Builder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>;
+    let ref_alt_hash_builder = Box::new(Int64Builder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>;
+
+    let a_ref_builder = Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>;
+    let a_alt_builder = Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>;
+
+    fields_buffer.push(contig_builder);
+    fields_buffer.push(pos_builder);
+    fields_buffer.push(ref_alt_hash_builder);
+    fields_buffer.push(a_ref_builder);
+    fields_buffer.push(a_alt_builder);
+
+
+    for info_key in infos_keys.iter() {
+        let info = infos.get(*info_key).unwrap();
+
+        let builder = match info.value_type {
+            ValueType::String => Box::new(StringBuilder::new()) as Box<dyn ArrayBuilder>,
+            ValueType::Float => {
+                Box::new(Float64Builder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>
+            }
+            ValueType::Integer => {
+                Box::new(Int32Builder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>
+            }
+            ValueType::Flag => {
+                Box::new(BooleanBuilder::with_capacity(batch_size)) as Box<dyn ArrayBuilder>
+            }
+        };
+
+        fields_buffer.push(builder);
+    }
+    Ok(fields_buffer)
+}
+pub fn get_infos_keys(infos:&HashMap<String,InfoFormatConfig>) -> anyhow::Result<Vec<&String>>{
+    let mut infos_keys = infos.keys().collect::<Vec<_>>();
+    infos_keys.sort();
+
+    // take only gnomad annotation with format : {annot}_{pop}_{sex}
+    let mut special = Vec::new();
+    let annots = vec!["AC", "AF", "AN", "nhomalt"];
+    let pops = vec![
+        "",
+        "_afr",
+        "_ami",
+        "_amr",
+        "_asj",
+        "_eas",
+        "_fin",
+        "_nfe",
+        "_remaining",
+        "_sas",
+        "_mid",
+    ];
+    let sexes = vec!["", "_XX", "_XY"];
+
+    for annot in annots.iter() {
+        for pop in pops.iter() {
+            for sexe in sexes.iter() {
+                special.push(format!("{}{}{}", annot, pop, sexe))
+            }
+        }
+    }
+
+    infos_keys = infos_keys
+        .into_iter()
+        .filter(|x| special.contains(x))
+        .collect();
+
+    Ok(infos_keys)
+
+}
+pub fn get_schema(infos:&HashMap<String,InfoFormatConfig>,infos_keys:&Vec<&String>) -> anyhow::Result<Arc<Schema>> {
+    let mut fields = Vec::new();
+    fields.push(Field::new("chrom", DataType::Int32, false));
+    fields.push(Field::new("pos", DataType::Int32, false));
+    fields.push(Field::new("ref_alt_hash", DataType::Int64, false));
+    fields.push(Field::new("a_ref", DataType::Utf8, false));
+    fields.push(Field::new("a_alt", DataType::Utf8, false));
+
+    for key in infos_keys.iter() {
+        let info_f = infos.get(*key).unwrap();
+        match info_f.value_type {
+            ValueType::Flag => fields.push(Field::new(*key, DataType::Boolean, true)),
+            ValueType::Float => fields.push(Field::new(*key, DataType::Float64, true)),
+            ValueType::String => fields.push(Field::new(*key, DataType::Utf8, true)),
+            ValueType::Integer => fields.push(Field::new(*key, DataType::Int32, true)),
+        }
+    }
+
+    let schema = Arc::new(Schema::new(fields));
+    Ok(schema)
+}
+pub fn get_writer(schema:Arc<Schema>,output_file:String,batch_size:usize) -> anyhow::Result<ArrowWriter<File>>{
+    
+    // Default writer properties
+    let props = WriterProperties::builder()
+        //.set_write_batch_size(batch_size)
+        .set_writer_version(WriterVersion::PARQUET_1_0)
+        .set_statistics_enabled(EnabledStatistics::Page)
+        .set_max_row_group_size(batch_size)
+        .set_compression(Compression::SNAPPY)
+        .build();
+
+    let file = std::fs::File::create(output_file).unwrap();
+    let writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    Ok(writer)
+}
 pub fn parse_all_info(
     info_fields: &str,
     infos: &HashMap<String, InfoFormatConfig>,
@@ -437,3 +497,4 @@ pub fn compute_contig_num(chrom_str_p: &str) -> anyhow::Result<u8> {
         },
     }
 }
+
