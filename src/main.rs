@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::anyhow;
 use arrow::array::*;
 use arrow::datatypes::*;
@@ -80,11 +81,14 @@ fn process(
         if l2.starts_with("##INFO") {
             // reader an INFO line
             // reading the annotation format
-            let info_f = parse_info(&l2).unwrap();
+            let info_f = parse_info(&l2)?;
             infos.insert(info_f.name.to_string(), info_f);
         }
     }
 
+    if infos.is_empty() {
+        return Err(anyhow::anyhow!("no info lines found"));
+    }
     let infos_keys = get_infos_keys(&infos)?;
 
     let batch_size = 100_000;
@@ -92,24 +96,26 @@ fn process(
     // construct arrow builders
     let mut fields_buffer = get_arrow_builders(&infos, &infos_keys, batch_size)?;
 
+    // construct parquet schema from info
     let schema = get_schema(&infos, &infos_keys)?;
+
+    
     let mut current_chrom = if let Some(c) = &only_chrom {
         compute_contig_num(c)?
     } else {
-        1
+        0 // mean : read the first chrom from the first line of the given gnomad file
     };
     let mut last_pos = 1;
 
-    let mut writer = get_writer(
-        schema.clone(),
-        format!("{}{}.parquet", ouput_fullname_prefix, current_chrom),
-        batch_size,
-    )?;
-
+    let mut writer: Option<ArrowWriter<File>> = None;
+    
     while let Some(Ok(l2)) = it.next() {
         let one_line = l2.split("\t").collect::<Vec<_>>();
 
         let chrom = compute_contig_num(one_line[0])?;
+        if current_chrom == 0 { // current_chrom read from the first gnomad line
+            current_chrom = chrom;
+        }
         if only_chrom.is_some() && chrom != current_chrom {
             last_pos = 1; // reset last_pos
             continue; // only_chrom is given, but chrom in line doesn't match, bypass
@@ -123,21 +129,24 @@ fn process(
                 for mut f in fields_buffer.into_iter() {
                     rb.push(f.finish() as ArrayRef);
                 }
-                let batch = RecordBatch::try_new(schema.clone(), rb).unwrap();
+                let batch = RecordBatch::try_new(schema.clone(), rb)?;
 
-                writer.write(&batch).expect("Writing batch");
+                if writer.is_none() {                
+                    writer = Some(get_writer(
+                        schema.clone(),
+                        format!("{}{}.parquet", ouput_fullname_prefix, current_chrom),
+                        batch_size,
+                    )?);
+                }
+                writer.as_mut().unwrap().write(&batch).expect("Writing batch");
             }
 
-            writer.close()?;
+            writer.take().unwrap().close()?;
 
             // create new chrom file
             current_chrom = chrom;
             last_pos = 1;
-            writer = get_writer(
-                schema.clone(),
-                format!("{}{}.parquet", ouput_fullname_prefix, current_chrom),
-                batch_size,
-            )?;
+            
             fields_buffer = get_arrow_builders(&infos, &infos_keys, batch_size)?;
         }
 
@@ -147,12 +156,12 @@ fn process(
 
         // check if gnomad file is well ordered
         if pos < last_pos {
-            return Err(anyhow!("current pos<last_pos, donc non trié !"));
+            return Err(anyhow!("current pos<last_pos, gnomad not sorted by pos abort !"));
         }
 
         last_pos = pos;
 
-        let h = parse_all_info(one_line.get(7).unwrap(), &infos, &infos_keys)?;
+        let h = parse_all_info(one_line.get(7).context("one_line problem")?, &infos, &infos_keys)?;
 
         fields_buffer[0]
             .as_any_mut()
@@ -183,7 +192,7 @@ fn process(
             .append_value(a_alt);
 
         for (index, info_key) in infos_keys.iter().enumerate() {
-            let b = &mut fields_buffer.get_mut(index + 4).unwrap();
+            let b = &mut fields_buffer.get_mut(index + 5).unwrap();
 
             let info = infos.get(*info_key).unwrap();
             let value = h.get(*info_key);
@@ -234,9 +243,16 @@ fn process(
             for mut f in fields_buffer.into_iter() {
                 rb.push(f.finish() as ArrayRef);
             }
-            let batch = RecordBatch::try_new(schema.clone(), rb).unwrap();
+            let batch = RecordBatch::try_new(schema.clone(), rb)?;
 
-            writer.write(&batch).expect("Writing batch");
+            if writer.is_none() {                
+                writer = Some(get_writer(
+                    schema.clone(),
+                    format!("{}{}.parquet", ouput_fullname_prefix, current_chrom),
+                    batch_size,
+                )?);
+            }
+            writer.as_mut().unwrap().write(&batch).expect("Writing batch");
 
             fields_buffer = get_arrow_builders(&infos, &infos_keys, batch_size)?;
         }
@@ -251,10 +267,18 @@ fn process(
         }
         let batch = RecordBatch::try_new(schema.clone(), rb).unwrap();
 
-        writer.write(&batch).expect("Writing batch");
+        if writer.is_none() {                
+            writer = Some(get_writer(
+                schema.clone(),
+                format!("{}{}.parquet", ouput_fullname_prefix, current_chrom),
+                batch_size,
+            )?);
+        }
+        writer.as_mut().unwrap().write(&batch).expect("Writing batch");
+        
     }
 
-    writer.close()?;
+    writer.take().unwrap().close()?;
 
     log::info!("nb variants converted {}", count);
     Ok(())
@@ -374,8 +398,8 @@ pub fn get_writer(
         .set_compression(Compression::SNAPPY)
         .build();
 
-    let file = std::fs::File::create(output_file).unwrap();
-    let writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    let file = std::fs::File::create(output_file)?;
+    let writer = ArrowWriter::try_new(file, schema, Some(props))?;
     Ok(writer)
 }
 pub fn parse_all_info(
@@ -498,4 +522,149 @@ pub fn compute_contig_num(chrom_str_p: &str) -> anyhow::Result<u8> {
             _ => Err(anyhow!("contig not reconize {}", chrom_str)),
         },
     }
+}
+
+// TODO : and comment cargo
+
+#[cfg(test)]
+mod tests {
+    
+    use super::*;
+
+    #[test]
+    fn test_input_file_not_found() {
+        let result = process("dummy_file_name", "/tmp", None);        
+        assert_eq!(result.is_err(),true)
+    }
+
+    #[test]
+    fn test_output_dir_notfound() {
+        let result = process("./test_data/gnomad-4.1-chr1-1000.vcf.bgz", "/tmp/xx/toto", None);
+        assert_eq!(result.is_err(),true)
+    }
+    
+    #[test]
+    fn test_no_info() {
+        let result = process("./test_data/gnomad-4.1-chr1-without-info.vcf.bgz", "/tmp/toto_", None);
+        assert_eq!(result.is_err(),true)
+    }
+    
+    #[test]
+    fn test_not_sorted() {
+        let result = process("./test_data/gnomad-4.1-chr1-1000-not-sorted.vcf.gz", "/tmp/toto_", None);
+        assert_eq!(result.is_err(),true)
+    }
+    
+
+    #[test]
+    fn test_convert_monochrom() {
+
+        let prefix="/tmp/test_convert_monochrom_gnomad_";
+        let p1_f = format!("{prefix}1.parquet");
+        let p2_f = format!("{prefix}2.parquet");
+        let p1 = std::path::Path::new(&p1_f);
+        let p2 = std::path::Path::new(&p2_f);
+        
+
+        if p1.exists() {
+            std::fs::remove_file(p1).context("can't delete tmp file").unwrap();
+        }
+        if p2.exists() {
+            std::fs::remove_file(p2).context("can't delete tmp file").unwrap();
+        }
+
+        let result1 = process("./test_data/gnomad-4.1-chr1-1000.vcf.bgz", prefix, None);
+        let result2 = process("./test_data/gnomad-4.1-chr2-1000.vcf.bgz", prefix, None);
+        
+        let p1_exists = p1.exists();
+        let p2_exists = p2.exists();
+
+        if p1.exists() {
+            std::fs::remove_file(p1).context("can't delete tmp file").unwrap();
+        }
+        if p2.exists() {
+            std::fs::remove_file(p2).context("can't delete tmp file").unwrap();
+        }
+
+        assert_eq!(result1.is_ok(), true);
+        assert_eq!(p1_exists, true);
+        assert_eq!(result2.is_ok(), true);
+        assert_eq!(p2_exists, true);
+
+        
+    }
+
+    #[test]
+    fn test_convert_multichrom_only_one_chrom() {
+
+        let prefix="/tmp/test_convert_multichrom_one_chrom_gnomad_";
+        let p1_f = format!("{prefix}1.parquet");
+        let p2_f = format!("{prefix}2.parquet");
+        let p1 = std::path::Path::new(&p1_f);
+        let p2 = std::path::Path::new(&p2_f);
+
+        if p1.exists() {
+            std::fs::remove_file(p1).context("can't delete tmp file").unwrap();
+        }
+        if p2.exists() {
+            std::fs::remove_file(p2).context("can't delete tmp file").unwrap();
+        }
+
+        let result2 = process("./test_data/gnomad-4.1-multi_chrom.vcf.gz", prefix, Some("2".to_string()));
+        
+        
+        let p1_exists = p1.exists();
+        let p2_exists = p2.exists();
+        
+        if p1.exists() {
+            std::fs::remove_file(p1).context("can't delete tmp file").unwrap();
+        }
+        if p2.exists() {
+            std::fs::remove_file(p2).context("can't delete tmp file").unwrap();
+        }
+
+        assert_eq!(result2.is_ok() ,true);
+        assert_eq!(p1_exists,false);
+        assert_eq!(p2_exists ,true);
+
+        
+    }
+
+    #[test]
+    fn test_convert_multichrom_all_chrom() {
+
+
+        let prefix="/tmp/test_convert_multichrom_all_chrom_gnomad_";
+        let p1_f = format!("{prefix}1.parquet");
+        let p2_f = format!("{prefix}2.parquet");
+        let p1 = std::path::Path::new(&p1_f);
+        let p2 = std::path::Path::new(&p2_f);
+
+        if p1.exists() {
+            std::fs::remove_file(p1).context("can't delete tmp file").unwrap();
+        }
+        if p2.exists() {
+            std::fs::remove_file(p2).context("can't delete tmp file").unwrap();
+        }
+
+        let result = process("./test_data/gnomad-4.1-multi_chrom.vcf.gz", prefix, None);
+                
+        let p1_exists = p1.exists();
+        let p2_exists = p2.exists();
+
+        if p1.exists() {
+            std::fs::remove_file(p1).context("can't delete tmp file").unwrap();
+        }
+        if p2.exists() {
+            std::fs::remove_file(p2).context("can't delete tmp file").unwrap();
+        }
+
+        assert_eq!(result.is_ok() ,true);
+        assert_eq!(p1_exists,true);
+        assert_eq!(p2_exists,true);
+
+        
+    }
+    
+
 }
