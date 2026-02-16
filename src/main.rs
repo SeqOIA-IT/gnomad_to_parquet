@@ -1,5 +1,5 @@
-use anyhow::anyhow;
 use anyhow::Context;
+use anyhow::anyhow;
 use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn test_input_file_not_found() {
         let result = process("dummy_file_name", "/tmp", None);
-        assert_eq!(result.is_err(), true)
+        assert!(result.is_err())
     }
 
     #[test]
@@ -624,7 +624,7 @@ mod tests {
             "/tmp/xx/toto",
             None,
         );
-        assert_eq!(result.is_err(), true)
+        assert!(result.is_err())
     }
 
     #[test]
@@ -634,7 +634,7 @@ mod tests {
             "/tmp/toto_",
             None,
         );
-        assert_eq!(result.is_err(), true)
+        assert!(result.is_err())
     }
 
     #[test]
@@ -644,7 +644,7 @@ mod tests {
             "/tmp/toto_",
             None,
         );
-        assert_eq!(result.is_err(), true)
+        assert!(result.is_err())
     }
 
     #[test]
@@ -728,9 +728,9 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(result2.is_ok(), true);
-        assert_eq!(p1_exists, false);
-        assert_eq!(p2_exists, true);
+        assert!(result2.is_ok());
+        assert!(!p1_exists);
+        assert!(p2_exists);
     }
 
     #[test]
@@ -768,8 +768,8 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(result.is_ok(), true);
-        assert_eq!(p1_exists, true);
-        assert_eq!(p2_exists, true);
+        assert!(result.is_ok());
+        assert!(p1_exists);
+        assert!(p2_exists);
     }
 }
