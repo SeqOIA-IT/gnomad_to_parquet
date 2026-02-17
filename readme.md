@@ -8,7 +8,7 @@ To be cross linux version compatible :
 ## usage
 ``gnomad_to_parquet --prefix-output-filename my_gnomad_name_ --output-dir /tmp --input-fullname /data/gnomad.bgz --only-chrom 1``
 
-=> create the file gnomad_v4_chrom1.parquet (fixed name) into /tmp
+=> create the file my_gnomad_name_1.parquet into /tmp
 
 ## documentation
 ``cargo doc --no-deps``
